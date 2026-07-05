@@ -72,6 +72,25 @@ class IncludeFact:
         _require_line(self.start_line, f"IncludeFact.start_line in {self.file_path}")
 
 
+@dataclass(frozen=True)
+class DocComment:
+    """An authoritative source doc comment (Doxygen `/** */`) attached to a symbol.
+
+    Unlike the other facts, this carries human-written prose lifted verbatim from
+    the source, so the wiki can explain WHAT a symbol does instead of inferring it
+    from name patterns and graph topology.
+    """
+
+    symbol_name: str
+    summary: str
+    params: tuple[tuple[str, str], ...] = ()
+    returns: str | None = None
+
+    def validate(self) -> None:
+        _require(self.symbol_name, "DocComment.symbol_name")
+        _require(self.summary, f"DocComment.summary for {self.symbol_name}")
+
+
 @dataclass
 class CodeFacts:
     repo_root: Path

@@ -3,6 +3,7 @@ from pathlib import Path
 from makewiki.analysis import FixtureAnalyzer
 from makewiki.config import load_config
 from makewiki.errors import WikiValidationError
+from makewiki.graph import DocComment
 from makewiki.wiki import generate_wiki, validate_wiki
 
 
@@ -79,6 +80,34 @@ def test_generate_wiki_writes_index_and_symbol_pages(tmp_path):
     assert "[do_work](worker.c-do_work.md)" in handle_text
     assert "[main](main.c-main.md)" in handle_text
     assert "flowchart TD" in handle_text
+
+
+def test_generate_wiki_renders_doc_comment_description(tmp_path):
+    config = load_config(ROOT)
+    graph = FixtureAnalyzer().analyze(ROOT.resolve(), config).graph
+    docs = {
+        "handle_request": DocComment(
+            symbol_name="handle_request",
+            summary="Handle one inbound request end to end.",
+            params=(("req", "The request to process."),),
+            returns="0 on success.",
+        )
+    }
+
+    generate_wiki(graph, config, tmp_path, max_depth=3, docs=docs)
+
+    page = (tmp_path / "symbols" / "main.c-handle_request.md").read_text(encoding="utf-8")
+    assert "## Description" in page
+    assert "Handle one inbound request end to end." in page
+    assert "`req`" in page
+    assert "The request to process." in page
+    assert "0 on success." in page
+    # The Description must appear before the inferred heuristic section.
+    assert page.index("## Description") < page.index("## What To Look For")
+    # A symbol without a doc comment stays heuristic-only.
+    other = (tmp_path / "symbols" / "main.c-parse_input.md").read_text(encoding="utf-8")
+    assert "## Description" not in other
+    assert validate_wiki(graph, tmp_path) == []
 
 
 def test_validate_wiki_accepts_graph_backed_pages(tmp_path):

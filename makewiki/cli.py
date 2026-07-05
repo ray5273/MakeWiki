@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from makewiki.analysis import ClangdAnalyzer, FixtureAnalyzer, JoernAnalyzer
+from makewiki.analysis.docs import build_doc_index
 from makewiki.build import discover_compile_commands
 from makewiki.config import load_config
 from makewiki.errors import GraphError, MakeWikiError
@@ -88,6 +89,13 @@ def _build_parser() -> argparse.ArgumentParser:
     wiki_generate.add_argument("--out", default=".makewiki/wiki")
     wiki_generate.add_argument("--graph-out", default=".makewiki/out")
     wiki_generate.add_argument("--depth", type=int, default=2)
+    wiki_generate.add_argument(
+        "--doc-root",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Extra directory to scan for doc comments (e.g. a project's include/ tree). Repeatable.",
+    )
     wiki_generate.add_argument("--analyzer", choices=["fixture", "clangd", "joern"], default="joern")
     wiki_generate.add_argument("--llm", choices=["none", "openrouter"], default="none")
     wiki_generate.add_argument("--llm-model")
@@ -222,9 +230,12 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
     if not out_path.is_absolute():
         out_path = repo_root / out_path
     llm_client = _llm_client(args.llm, args.llm_model, args.llm_rpm)
-    pages = generate_wiki(graph, config, out_path, max_depth=args.depth, llm_client=llm_client)
+    doc_roots = [Path(root).resolve() for root in args.doc_root]
+    docs = build_doc_index(repo_root, extra_roots=doc_roots)
+    pages = generate_wiki(graph, config, out_path, max_depth=args.depth, llm_client=llm_client, docs=docs)
     print(f"wiki: {out_path}")
     print(f"pages: {len(pages)}")
+    print(f"doc comments: {len(docs)}")
     return 0
 
 

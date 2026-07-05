@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from makewiki.config import MakeWikiConfig
-from makewiki.graph import CodeEdge, CodeGraph, SymbolNode, extract_subgraph
+from makewiki.graph import CodeEdge, CodeGraph, DocComment, SymbolNode, extract_subgraph
 from makewiki.llm import LLMClient
 from makewiki.render import render_mermaid
 
@@ -25,8 +25,11 @@ def generate_wiki(
     max_depth: int = 2,
     llm_client: LLMClient | None = None,
     llm_scope: str = "modules",
+    docs: dict[str, DocComment] | None = None,
 ) -> list[WikiPage]:
     """Write deterministic graph-backed Markdown wiki pages."""
+
+    docs = docs or {}
 
     output_root = Path(out_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +124,7 @@ def generate_wiki(
                 outgoing.get(node.id, []),
                 symbol_paths,
                 max_depth=max_depth,
+                doc=docs.get(node.name),
             ),
             encoding="utf-8",
         )
@@ -436,6 +440,7 @@ def _render_symbol_page(
     symbol_paths: dict[str, Path],
     *,
     max_depth: int,
+    doc: DocComment | None = None,
 ) -> str:
     subgraph = extract_subgraph(graph, node.id, max_depth, edge_types={"calls"})
     role = _symbol_role(node, incoming, outgoing)
@@ -446,15 +451,21 @@ def _render_symbol_page(
         "",
         f"{role} The implementation starts at `{node.file_path}:{node.start_line}`.",
         "",
-        "## What To Look For",
-        "",
-        _symbol_reading_hint(node, incoming, outgoing, graph),
-        "",
-        "## Evidence",
-        "",
-        f"- Location: `{node.file_path}:{node.start_line}`",
-        f"- Kind: `{node.kind}`",
     ]
+    if doc is not None:
+        lines.extend(_doc_comment_lines(doc))
+    lines.extend(
+        [
+            "## What To Look For",
+            "",
+            _symbol_reading_hint(node, incoming, outgoing, graph),
+            "",
+            "## Evidence",
+            "",
+            f"- Location: `{node.file_path}:{node.start_line}`",
+            f"- Kind: `{node.kind}`",
+        ]
+    )
     if node.signature:
         lines.append(f"- Signature: `{node.signature}`")
     if node.end_line is not None:
@@ -493,6 +504,24 @@ def _render_symbol_page(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _doc_comment_lines(doc: DocComment) -> list[str]:
+    """Render an authoritative source doc comment as a Description section.
+
+    This is verbatim human-written prose from the source, so it leads over the
+    name-pattern heuristics in the sections that follow.
+    """
+    lines = ["## Description", "", doc.summary, ""]
+    if doc.params:
+        lines.extend(["**Parameters**", ""])
+        for name, desc in doc.params:
+            suffix = f" - {desc}" if desc else ""
+            lines.append(f"- `{name}`{suffix}")
+        lines.append("")
+    if doc.returns:
+        lines.extend(["**Returns:** " + doc.returns, ""])
+    return lines
 
 
 def _edge_indexes(graph: CodeGraph) -> tuple[dict[str, list[CodeEdge]], dict[str, list[CodeEdge]]]:
