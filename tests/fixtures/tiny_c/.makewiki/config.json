@@ -1,0 +1,19 @@
+{
+  "build": {
+    "run_build": false,
+    "exclude_dirs": ["ignored/"]
+  },
+  "repo_notes": [
+    { "content": "Tiny fixture for deterministic callgraph tests.", "author": "tests" }
+  ],
+  "diagrams": [
+    {
+      "title": "Main Flow",
+      "purpose": "Exercise call graph extraction",
+      "root_function": "main",
+      "diagram_type": "callgraph",
+      "max_depth": 3
+    }
+  ]
+}
+

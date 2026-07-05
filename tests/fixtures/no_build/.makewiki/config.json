@@ -1,0 +1,8 @@
+{
+  "build": {
+    "compile_commands_path": "missing/compile_commands.json",
+    "build_command": "bear -- make",
+    "run_build": false
+  }
+}
+

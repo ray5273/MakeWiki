@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "makewiki"
+version = "0.1.0"
+description = "Deterministic C/C++ call graph extraction and Mermaid rendering MVP."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+makewiki = "makewiki.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["makewiki*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

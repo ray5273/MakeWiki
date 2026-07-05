@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+external/
+.makewiki/out/
+tests/fixtures/**/.makewiki/out/
+.tools/
+workspace/
