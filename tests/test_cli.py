@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 
 from makewiki.cli import main
-from makewiki.llm import OPENROUTER_LOCKED_MODEL
+from makewiki.llm import OPENROUTER_DEFAULT_MODELS
 
 
 ROOT = Path(__file__).parent / "fixtures" / "tiny_c"
@@ -194,6 +194,101 @@ def test_cli_wiki_validate_requires_existing_graph(tmp_path, capsys):
     assert "graph store not found:" in capsys.readouterr().err
 
 
+def test_cli_wiki_test_accepts_generated_pages(tmp_path, capsys):
+    out = tmp_path / "wiki"
+    graph_out = tmp_path / "graph"
+    report = tmp_path / "quality.md"
+
+    assert (
+        main(
+            [
+                "wiki",
+                "generate",
+                str(ROOT),
+                "--out",
+                str(out),
+                "--graph-out",
+                str(graph_out),
+                "--analyzer",
+                "fixture",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "wiki",
+                "test",
+                str(ROOT),
+                "--wiki",
+                str(out),
+                "--graph-out",
+                str(graph_out),
+                "--report",
+                str(report),
+            ]
+        )
+        == 0
+    )
+
+    cli_out = capsys.readouterr().out
+    assert "validation issues: 0" in cli_out
+    assert "pass rate: 100%" in cli_out
+    assert report.exists()
+
+
+def test_cli_wiki_test_returns_2_for_validation_issue(tmp_path, capsys):
+    out = tmp_path / "wiki"
+    graph_out = tmp_path / "graph"
+    assert main(["wiki", "generate", str(ROOT), "--out", str(out), "--graph-out", str(graph_out), "--analyzer", "fixture"]) == 0
+    capsys.readouterr()
+    page = out / "symbols" / "main.c-main.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("`main.c:12`", "`missing.c:12`", 1), encoding="utf-8")
+
+    assert main(["wiki", "test", str(ROOT), "--wiki", str(out), "--graph-out", str(graph_out)]) == 2
+
+    assert "validation issues: 1" in capsys.readouterr().out
+
+
+def test_cli_wiki_test_returns_2_when_pass_rate_below_threshold(tmp_path, capsys):
+    out = tmp_path / "wiki"
+    graph_out = tmp_path / "graph"
+    assert main(["wiki", "generate", str(ROOT), "--out", str(out), "--graph-out", str(graph_out), "--analyzer", "fixture"]) == 0
+    capsys.readouterr()
+    module = out / "modules" / "root.md"
+    module.write_text(
+        module.read_text(encoding="utf-8").replace(
+            "## Reading Path",
+            "## LLM Summary\n\n- This summary makes broad claims without anchors.\n\n## Reading Path",
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        main(
+            [
+                "wiki",
+                "test",
+                str(ROOT),
+                "--wiki",
+                str(out),
+                "--graph-out",
+                str(graph_out),
+                "--min-pass-rate",
+                "1.0",
+            ]
+        )
+        == 2
+    )
+
+    cli_out = capsys.readouterr().out
+    assert "pass rate: 0%" in cli_out
+    assert "ungrounded: 1" in cli_out
+
+
 def test_cli_wiki_openrouter_requires_key(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
@@ -218,30 +313,12 @@ def test_cli_wiki_openrouter_requires_key(tmp_path, capsys, monkeypatch):
     assert "OPENROUTER_API_KEY is required" in capsys.readouterr().err
 
 
-def test_cli_wiki_openrouter_rejects_other_models(tmp_path, capsys, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+def test_cli_doctor_reports_openrouter_fallback_chain(capsys):
+    assert main(["doctor", str(ROOT)]) == 0
 
-    assert (
-        main(
-            [
-                "wiki",
-                "generate",
-                str(ROOT),
-                "--out",
-                str(tmp_path / "wiki"),
-                "--graph-out",
-                str(tmp_path / "graph"),
-                "--llm",
-                "openrouter",
-                "--llm-model",
-                "openai/gpt-4o-mini",
-            ]
-        )
-        == 2
-    )
-
-    assert f"OpenRouter model is locked to {OPENROUTER_LOCKED_MODEL}" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    for model in OPENROUTER_DEFAULT_MODELS:
+        assert model in out
 
 
 def test_cli_fixture_analyzer_pipeline(tmp_path, capsys):

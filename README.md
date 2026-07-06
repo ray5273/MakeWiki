@@ -30,12 +30,19 @@ For a larger C project, Joern gives better results than the buildless fallback:
 .venv/bin/makewiki doctor external/spdk/lib/event
 .venv/bin/makewiki wiki generate external/spdk/lib/event \
   --analyzer joern \
+  --llm openrouter \
+  --llm-scope all \
+  --repair-attempts 2 \
   --out external/output/spdk_lib_event_wiki \
   --graph-out external/output/spdk_lib_event_graph \
   --depth 2
+.venv/bin/makewiki wiki test external/spdk/lib/event \
+  --wiki external/output/spdk_lib_event_wiki \
+  --graph-out external/output/spdk_lib_event_graph \
+  --report external/output/spdk_lib_event_quality.md
 ```
 
-Open `external/output/spdk_lib_event_wiki/index.md`.
+Open `external/output/spdk_lib_event_wiki/index.md` after `wiki test` reports a 100% pass rate.
 
 ## Optional LLM Summaries
 
@@ -52,7 +59,9 @@ export OPENROUTER_API_KEY=...
 .venv/bin/makewiki wiki generate external/spdk/lib/event \
   --analyzer joern \
   --llm openrouter \
+  --llm-scope all \
   --llm-model nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
+  --repair-attempts 2 \
   --out external/output/spdk_lib_event_nemotron_wiki \
   --graph-out external/output/spdk_lib_event_nemotron_graph
 ```
@@ -68,6 +77,7 @@ makewiki analyze <repo> --analyzer joern|clangd|fixture
 makewiki render <repo> --root <symbol>
 makewiki wiki generate <repo>
 makewiki wiki validate <repo>
+makewiki wiki test <repo> --wiki <wiki-dir> --graph-out <graph-dir> --report <report.md>
 ```
 
 ## Analyzer Choices
@@ -86,4 +96,4 @@ Run `makewiki doctor <repo>` first when setup is unclear. It reports missing too
 - `symbols/`: exact function reference pages.
 - `reference.md`: complete symbol index.
 
-Every non-index page includes source citations such as `app.c:881`, and `makewiki wiki validate` checks that those citations and links resolve.
+Every non-index page includes source citations such as `app.c:881`, and `makewiki wiki validate` checks that those citations and links resolve. `makewiki wiki test` runs validation plus documentation-quality checks for shallow summaries, missing runtime story, overpacked modules, and coverage imbalance.

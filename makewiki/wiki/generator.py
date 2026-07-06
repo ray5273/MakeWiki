@@ -9,6 +9,8 @@ from makewiki.config import MakeWikiConfig
 from makewiki.graph import CodeEdge, CodeGraph, DocComment, SymbolNode, extract_subgraph
 from makewiki.llm import LLMClient
 from makewiki.render import render_mermaid
+from makewiki.wiki.evaluate import SummaryFinding, evaluate_summary_text
+from makewiki.wiki.source import read_source_snippet
 
 
 @dataclass(frozen=True)
@@ -26,8 +28,11 @@ def generate_wiki(
     llm_client: LLMClient | None = None,
     llm_scope: str = "modules",
     docs: dict[str, DocComment] | None = None,
+    repair_attempts: int = 0,
 ) -> list[WikiPage]:
     """Write deterministic graph-backed Markdown wiki pages."""
+    if repair_attempts < 0:
+        raise ValueError("repair_attempts must be >= 0")
 
     docs = docs or {}
 
@@ -109,6 +114,7 @@ def generate_wiki(
                 module_paths,
                 max_depth=max_depth,
                 llm_client=llm_client if llm_scope in {"modules", "all"} else None,
+                repair_attempts=repair_attempts,
             ),
             encoding="utf-8",
         )
@@ -125,6 +131,8 @@ def generate_wiki(
                 symbol_paths,
                 max_depth=max_depth,
                 doc=docs.get(node.name),
+                llm_client=llm_client if llm_scope in {"symbols", "all"} else None,
+                repair_attempts=repair_attempts,
             ),
             encoding="utf-8",
         )
@@ -167,6 +175,12 @@ def _render_index(
         "",
     ]
     lines.extend(_major_subsystem_lines(nodes))
+    lines.extend(["", "## Subsystem Map", ""])
+    lines.extend(_system_map_lines(nodes, modules, module_paths, outgoing))
+    lines.extend(["", "## Runtime Story", ""])
+    lines.extend(_runtime_story_lines(nodes, symbol_paths))
+    lines.extend(["", "## Read by Task", ""])
+    lines.extend(_read_by_task_lines(nodes, symbol_paths))
     lines.extend(
         [
             "",
@@ -262,9 +276,11 @@ def _render_flow_page(
         "",
         _flow_summary(root, ordered, subgraph),
         "",
-        "## Phase Map",
-        "",
     ]
+    phase_lines = _known_flow_phase_lines(root)
+    if phase_lines:
+        lines.extend(["## Key Phases", "", *phase_lines, ""])
+    lines.extend(["## Phase Map", ""])
     lines.extend(_phase_map_lines(root, subgraph, outgoing, symbol_paths))
     lines.extend(
         [
@@ -278,6 +294,8 @@ def _render_flow_page(
         lines.append(f"{idx}. {_walkthrough_sentence(node, calls, symbol_paths)}")
     if len(ordered) > 20:
         lines.append(f"{len(ordered) - 20} additional functions are included in the diagram below.")
+    lines.extend(["", "## Failure and Shutdown Notes", ""])
+    lines.extend(_flow_failure_shutdown_lines(ordered, symbol_paths))
     lines.extend(["", "## Call Graph", "", "```mermaid", render_mermaid(subgraph).rstrip(), "```", ""])
     lines.extend(["## Entry Context", ""])
     callers = [graph.nodes[edge.src_id] for edge in incoming.get(root.id, []) if edge.src_id in graph.nodes]
@@ -301,6 +319,7 @@ def _render_module_page(
     *,
     max_depth: int,
     llm_client: LLMClient | None,
+    repair_attempts: int,
 ) -> str:
     node_ids = {node.id for node in nodes}
     internal_edges = [
@@ -352,6 +371,9 @@ def _render_module_page(
         "",
         ]
     )
+    subarea_lines = _module_subarea_lines(module, nodes, symbol_paths, module_paths)
+    if subarea_lines:
+        lines.extend(["## Subareas", "", *subarea_lines, ""])
     if llm_client is not None:
         lines.extend(
             [
@@ -364,18 +386,27 @@ def _render_module_page(
                     internal_edges,
                     inbound_edges,
                     outbound_edges,
+                    repair_attempts=repair_attempts,
                 ),
                 "",
             ]
         )
 
-    lines.extend(["## Reading Path", ""])
+    lines.extend(["## Top Anchors", ""])
     if roots:
         for node in roots[:10]:
             outgoing_count = len(outgoing.get(node.id, []))
             lines.append(f"- Start with [{node.name}]({_relative_symbol_from_module(module, node, symbol_paths, module_paths)}) at `{node.file_path}:{node.start_line}`. {_node_intent(node)} It reaches {outgoing_count} direct calls in this graph.")
     else:
         lines.append("- None")
+
+    internal_paths = _important_internal_path_lines(module, nodes, outgoing, symbol_paths, module_paths)
+    if internal_paths:
+        lines.extend(["", "## Important Internal Paths", ""])
+        lines.extend(internal_paths)
+
+    lines.extend(["", "## Reading Path", ""])
+    lines.append("Use Top Anchors for entry points, then follow Important Internal Paths and the symbol list below for exact source pages.")
 
     lines.extend(["", "## Module Call Graph", "", "```mermaid", render_mermaid(diagram).rstrip(), "```", "", "## Symbols", ""])
     for node in nodes:
@@ -391,45 +422,137 @@ def _generate_module_summary(
     internal_edges: list[CodeEdge],
     inbound_edges: list[CodeEdge],
     outbound_edges: list[CodeEdge],
+    *,
+    repair_attempts: int = 0,
 ) -> str:
-    evidence_nodes = nodes[:40]
-    allowed_citations = ", ".join(f"`{node.file_path}:{node.start_line}`" for node in evidence_nodes[:20])
+    evidence_nodes = _balanced_module_evidence(nodes, limit=40)
+    allowed_tokens = [f"{node.file_path}:{node.start_line}" for node in evidence_nodes[:24]]
+    allowed_citations = ", ".join(f"`{token}`" for token in allowed_tokens)
     system = (
         "You write concise code wiki documentation from provided graph evidence only. "
         "Do not invent files, functions, or call relationships. "
         "Every non-trivial claim must include one of the provided `file:line` citations. "
         "Return only final Markdown bullets. Do not reveal analysis or reasoning. Do not output Mermaid."
     )
-    user = "\n".join(
-        [
-            f"Module: {module}",
-            f"Symbol count: {len(nodes)}",
-            f"Internal call count: {len(internal_edges)}",
-            f"Inbound call count: {len(inbound_edges)}",
-            f"Outbound call count: {len(outbound_edges)}",
-            "",
-            "Allowed citations:",
-            allowed_citations or "(none)",
-            "",
-            "Representative symbols:",
-            *[
-                f"- {node.name}: `{node.file_path}:{node.start_line}` signature={node.signature or '(unknown)'}"
-                for node in evidence_nodes
-            ],
-            "",
-            "Write 2-4 final Markdown bullets explaining the module's likely responsibility and reading order. "
-            "Start every line with '- '. Use only the allowed citations. "
-            "Do not include a preface, labels, hidden reasoning, or draft notes.",
-        ]
+    base_user_lines = [
+        f"Module: {module}",
+        f"Symbol count: {len(nodes)}",
+        f"Internal call count: {len(internal_edges)}",
+        f"Inbound call count: {len(inbound_edges)}",
+        f"Outbound call count: {len(outbound_edges)}",
+        "",
+        "Allowed citations:",
+        allowed_citations or "(none)",
+        "",
+        "Coverage anchors by file/domain:",
+        *_module_prompt_anchor_lines(nodes),
+        "",
+        "Representative symbols:",
+        *[
+            f"- {node.name}: `{node.file_path}:{node.start_line}` signature={node.signature or '(unknown)'}"
+            for node in evidence_nodes
+        ],
+        "",
+        "Write 3-4 final Markdown bullets. Cover responsibility, the main runtime path, and failure/shutdown/control-plane relevance when present. "
+        "Do not summarize only one file if the coverage anchors list multiple files. "
+        "Start every line with '- '. Use only the allowed citations. "
+        "Do not include a preface, labels, hidden reasoning, or draft notes.",
+    ]
+    return _complete_summary_with_repair(
+        llm_client,
+        system=system,
+        base_user="\n".join(base_user_lines),
+        repair_attempts=repair_attempts,
+        audit=lambda summary: evaluate_summary_text(
+            page=_module_slug(module),
+            page_type="module",
+            section="LLM Summary",
+            summary=summary,
+            allowed_citations=set(allowed_tokens),
+            anchor_names={module, _display_module(module)} | {node.name for node in evidence_nodes},
+        ).findings,
     )
-    return _normalize_llm_summary(llm_client.complete(system=system, user=user))
+
+
+# Deterministic replacement when the model returns no usable prose. Same tone as
+# the no-context branch of _symbol_reading_hint so the page still guides reading.
+_SUMMARY_FALLBACK = (
+    "- No reliable summary could be generated; read the source range and the "
+    "caller/callee sections below as the primary evidence."
+)
+
+# Phrases that mark leaked chain-of-thought rather than final prose. Reasoning
+# models (e.g. the nemotron fallback) sometimes emit their scratch work as
+# bullets, which the "starts with '- '" filter alone would let through.
+_REASONING_MARKERS = re.compile(
+    r"\b(actually|let'?s|let us|not sure|we need to|we can|i'?ll|maybe)\b|\?\s",
+    re.IGNORECASE,
+)
+
+# A `file:line` citation token, e.g. `app.c:441`.
+_CITATION_TOKEN = re.compile(r"`[^`]+:\d+`")
+_BARE_CITATION_TOKEN = re.compile(r"(?<!`)([A-Za-z0-9_./+-]+\.[A-Za-z0-9_]+:\d+)(?!`)")
+
+_MAX_SUMMARY_BULLET_CHARS = 400
+
+
+def _looks_like_reasoning(line: str) -> bool:
+    return bool(_REASONING_MARKERS.search(line))
+
+
+def _dedupe_citations(text: str) -> str:
+    """Drop repeated `file:line` citations within one bullet, keeping the first.
+
+    Models grounded on a small graph tend to restate the same citation on every
+    clause (`app.c:441` six times in one bullet). Keeping the first occurrence
+    and stripping the rest — plus the separators left behind — keeps the prose
+    readable without dropping evidence.
+    """
+    seen: set[str] = set()
+    sentinel = "\x00"
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token in seen:
+            return sentinel
+        seen.add(token)
+        return token
+
+    out = _CITATION_TOKEN.sub(repl, text)
+    # Remove sentinels along with an adjacent list separator, then any strays.
+    out = re.sub(rf"\s*,\s*{sentinel}", "", out)
+    out = re.sub(rf"{sentinel}\s*,\s*", "", out)
+    out = out.replace(sentinel, "")
+    # Clean up empty or dangling parentheticals left by removed tokens.
+    out = re.sub(r"\(\s*\)", "", out)
+    out = re.sub(r"\(\s*,\s*", "(", out)
+    out = re.sub(r"\s*,\s*\)", ")", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([.,;)])", r"\1", out)
+    return out.rstrip()
+
+
+def _canonicalize_citations(text: str) -> str:
+    parts = text.split("`")
+    for idx in range(0, len(parts), 2):
+        parts[idx] = _BARE_CITATION_TOKEN.sub(r"`\1`", parts[idx])
+    return "`".join(parts)
 
 
 def _normalize_llm_summary(text: str) -> str:
     bullet_lines = [line.rstrip() for line in text.splitlines() if line.lstrip().startswith("- ")]
-    if bullet_lines:
-        return "\n".join(bullet_lines[:4])
-    return text.strip()
+    clean: list[str] = []
+    for line in bullet_lines:
+        if _looks_like_reasoning(line):
+            continue
+        line = _canonicalize_citations(line)
+        line = _dedupe_citations(line)
+        if len(line) > _MAX_SUMMARY_BULLET_CHARS:
+            line = line[:_MAX_SUMMARY_BULLET_CHARS].rstrip() + "…"
+        clean.append(line)
+    if clean:
+        return "\n".join(clean[:4])
+    return _SUMMARY_FALLBACK
 
 
 def _render_symbol_page(
@@ -441,11 +564,28 @@ def _render_symbol_page(
     *,
     max_depth: int,
     doc: DocComment | None = None,
+    llm_client: LLMClient | None = None,
+    repair_attempts: int = 0,
 ) -> str:
     subgraph = extract_subgraph(graph, node.id, max_depth, edge_types={"calls"})
     role = _symbol_role(node, incoming, outgoing)
+    generated_summary = None
+    if doc is None and llm_client is not None:
+        generated_summary = _generate_symbol_summary(llm_client, graph, node, incoming, outgoing, repair_attempts=repair_attempts)
+    # Load-bearing symbols have curated, domain-anchored What It Does bullets;
+    # those stay authoritative over LLM prose (which can drop key vocabulary like
+    # "blocking"/"shutdown"). The LLM prose still drives the ## Summary section.
+    known = _known_symbol_bullets(node)
+    if known:
+        what_it_does = "\n".join(known)
+    else:
+        what_it_does = generated_summary or _symbol_what_it_does(graph, node, incoming, outgoing)
     lines = [
         f"# {node.name}",
+        "",
+        "## What It Does",
+        "",
+        what_it_does,
         "",
         "## Role",
         "",
@@ -453,7 +593,17 @@ def _render_symbol_page(
         "",
     ]
     if doc is not None:
+        # A source doc comment is authoritative; prefer it over generated prose.
         lines.extend(_doc_comment_lines(doc))
+    elif llm_client is not None:
+        lines.extend(
+            [
+                "## Summary",
+                "",
+                generated_summary or what_it_does,
+                "",
+            ]
+        )
     lines.extend(
         [
             "## What To Look For",
@@ -524,6 +674,102 @@ def _doc_comment_lines(doc: DocComment) -> list[str]:
     return lines
 
 
+def _generate_symbol_summary(
+    llm_client: LLMClient,
+    graph: CodeGraph,
+    node: SymbolNode,
+    incoming: list[CodeEdge],
+    outgoing: list[CodeEdge],
+    *,
+    repair_attempts: int = 0,
+) -> str:
+    """Generate grounded prose for an undocumented symbol from its source body and graph context."""
+    callees = [graph.nodes[edge.dst_id] for edge in outgoing if edge.dst_id in graph.nodes]
+    callers = [graph.nodes[edge.src_id] for edge in incoming if edge.src_id in graph.nodes]
+    snippet = read_source_snippet(
+        graph.repo_root, node.file_path, node.start_line, end_line=node.end_line
+    )
+
+    allowed = [f"`{node.file_path}:{node.start_line}`"]
+    allowed.extend(f"`{n.file_path}:{n.start_line}`" for n in (*callees, *callers))
+    allowed_citations = ", ".join(dict.fromkeys(allowed))
+    allowed_tokens = {token.strip("`") for token in dict.fromkeys(allowed)}
+
+    system = (
+        "You write concise code wiki documentation from the provided source and graph evidence only. "
+        "Explain what the function does and why, based on its body. "
+        "Do not invent files, functions, or call relationships. "
+        "Ground claims in the provided `file:line` citations, but cite at most once per bullet, "
+        "as a trailing `(file:line)`. Never repeat the same citation and never narrate citations in prose. "
+        "Return only final Markdown bullets. Do not reveal analysis or reasoning. Do not output Mermaid."
+    )
+    base_user_lines = [
+        f"Function: {node.name}",
+        f"Location: `{node.file_path}:{node.start_line}`",
+        f"Signature: {node.signature or '(unknown)'}",
+        f"Calls: {', '.join(sorted(n.name for n in callees)) or '(none)'}",
+        f"Called by: {', '.join(sorted(n.name for n in callers)) or '(none)'}",
+        "",
+        "Allowed citations:",
+        allowed_citations or "(none)",
+        "",
+        "Source:",
+        "```c",
+        snippet or "(source unavailable)",
+        "```",
+        "",
+        "Write 1-3 final Markdown bullets explaining what this function does and its role. "
+        "Start every line with '- '. Use only the allowed citations, at most one per bullet, "
+        "placed as a trailing `(file:line)`. Do not repeat a citation. "
+        "Do not include a preface, labels, hidden reasoning, or draft notes.",
+    ]
+    return _complete_summary_with_repair(
+        llm_client,
+        system=system,
+        base_user="\n".join(base_user_lines),
+        repair_attempts=repair_attempts,
+        audit=lambda summary: evaluate_summary_text(
+            page=_symbol_slug(node),
+            page_type="symbol",
+            section="Summary",
+            summary=summary,
+            allowed_citations=allowed_tokens,
+            anchor_names={node.name} | {n.name for n in (*callees, *callers)},
+        ).findings,
+    )
+
+
+def _complete_summary_with_repair(
+    llm_client: LLMClient,
+    *,
+    system: str,
+    base_user: str,
+    repair_attempts: int,
+    audit,
+) -> str:
+    failures: list[SummaryFinding] = []
+    attempts = max(1, repair_attempts + 1)
+    for attempt in range(attempts):
+        user = base_user
+        if failures:
+            user = "\n".join(
+                [
+                    base_user,
+                    "",
+                    "Previous draft failed quality audit. Fix these deterministic findings:",
+                    *[f"- {finding.category}: {finding.detail}" for finding in failures],
+                    "Return a clean final draft only.",
+                ]
+            )
+        summary = _normalize_llm_summary(llm_client.complete(system=system, user=user))
+        if repair_attempts == 0:
+            return summary
+        failures = audit(summary)
+        if not failures:
+            return summary
+    return _SUMMARY_FALLBACK
+
+
 def _edge_indexes(graph: CodeGraph) -> tuple[dict[str, list[CodeEdge]], dict[str, list[CodeEdge]]]:
     incoming: dict[str, list[CodeEdge]] = {}
     outgoing: dict[str, list[CodeEdge]] = {}
@@ -566,6 +812,114 @@ def _system_map_lines(
     if not lines:
         lines.append("- No code areas were identified.")
     return lines
+
+
+def _runtime_story_lines(nodes: list[SymbolNode], symbol_paths: dict[str, Path]) -> list[str]:
+    ordered = _select_runtime_story_nodes(nodes)
+    if not ordered:
+        return ["- No high-signal runtime path was identified from symbol names."]
+
+    lines: list[str] = []
+    story = " -> ".join(f"`{node.name}`" for node in ordered[:8])
+    lines.append(f"- Main path: {story}.")
+    for node in ordered[:8]:
+        rel = _relative_to_output_root(symbol_paths[node.id]).as_posix()
+        lines.append(f"- [{node.name}]({rel}) - {_runtime_story_reason(node)} Evidence: `{node.file_path}:{node.start_line}`.")
+    return lines
+
+
+def _select_runtime_story_nodes(nodes: list[SymbolNode]) -> list[SymbolNode]:
+    preferred = (
+        "spdk_app_start",
+        "spdk_reactors_init",
+        "spdk_reactors_start",
+        "reactor_run",
+        "_reactor_run",
+        "event_queue_run_batch",
+        "spdk_app_stop",
+        "app_start_shutdown",
+        "spdk_reactors_fini",
+    )
+    by_name: dict[str, list[SymbolNode]] = {}
+    for node in nodes:
+        by_name.setdefault(node.name, []).append(node)
+    selected: list[SymbolNode] = []
+    for name in preferred:
+        matches = by_name.get(name, [])
+        if matches:
+            selected.append(sorted(matches, key=_node_sort_key)[0])
+    if selected:
+        return selected
+    ranked = sorted(
+        nodes,
+        key=lambda node: (-_runtime_story_score(node), node.file_path, node.start_line, node.id),
+    )
+    return [node for node in ranked if _runtime_story_score(node) > 0][:8]
+
+
+def _runtime_story_score(node: SymbolNode) -> int:
+    text = f"{node.file_path} {node.name}".lower()
+    score = 0
+    for token in ("app", "reactor", "event", "thread", "scheduler", "subsystem", "rpc"):
+        if token in text:
+            score += 4
+    for token in ("start", "init", "run", "bootstrap", "shutdown", "stop", "fini"):
+        if token in node.name.lower():
+            score += 8
+    if node.name.startswith("_"):
+        score -= 2
+    return score
+
+
+def _runtime_story_reason(node: SymbolNode) -> str:
+    name = node.name.lower()
+    # Shutdown/stop/fini must be checked before app_start: a name like
+    # `app_start_shutdown` contains "app_start" but is shutdown behavior, so
+    # matching startup first would describe teardown as bootstrap.
+    if "shutdown" in name or "stop" in name or "fini" in name:
+        return "belongs to shutdown, cleanup, or return-code handling"
+    if "app_start" in name or name == "spdk_app_start":
+        return "validates application options, initializes runtime state, and enters the blocking event runtime"
+    if "reactors_init" in name:
+        return "prepares reactor/core runtime state before work is dispatched"
+    if "reactors_start" in name:
+        return "starts reactor execution after initialization has succeeded"
+    if "reactor_run" in name:
+        return "drives the reactor loop where queued work, polling, interrupts, and scheduling hooks meet"
+    if "rpc" in name:
+        return "exposes control-plane inspection or mutation while the runtime is active"
+    return _node_intent(node)
+
+
+def _read_by_task_lines(nodes: list[SymbolNode], symbol_paths: dict[str, Path]) -> list[str]:
+    tasks = [
+        ("Understand app startup/shutdown", ("spdk_app_start", "app_start_shutdown", "spdk_app_stop", "spdk_app_fini")),
+        ("Understand the reactor loop", ("reactor_run", "_reactor_run", "event_queue_run_batch", "spdk_reactors_start")),
+        ("Understand RPC introspection", ("rpc_framework_get_reactors", "rpc_framework_get_scheduler", "rpc_get_subsystems")),
+        ("Understand scheduler behavior", ("_reactors_scheduler_gather_metrics", "balance_static", "scheduler_static_init")),
+    ]
+    lines: list[str] = []
+    for label, names in tasks:
+        matches = _find_named_nodes(nodes, names)
+        if not matches:
+            continue
+        links = ", ".join(
+            f"[{node.name}]({_relative_to_output_root(symbol_paths[node.id]).as_posix()})"
+            for node in matches[:5]
+        )
+        lines.append(f"- {label}: {links}.")
+    if lines:
+        return lines
+    return ["- Start with lifecycle, runtime-loop, control-plane, and scheduler-looking symbols listed in Key Interfaces."]
+
+
+def _find_named_nodes(nodes: list[SymbolNode], names: tuple[str, ...]) -> list[SymbolNode]:
+    selected: list[SymbolNode] = []
+    for name in names:
+        matches = [node for node in nodes if node.name == name]
+        if matches:
+            selected.append(sorted(matches, key=_node_sort_key)[0])
+    return selected
 
 
 def _major_subsystem_lines(nodes: list[SymbolNode]) -> list[str]:
@@ -690,9 +1044,9 @@ def _flow_summary(root: SymbolNode, ordered: list[SymbolNode], subgraph: CodeGra
     if len(files) > 4:
         file_text += f", and {len(files) - 4} more"
     return (
-        f"This flow explains `{root.name}` as a reader-facing execution path, starting at "
-        f"`{root.file_path}:{root.start_line}`. It expands to {len(ordered)} function(s) and "
-        f"{len(subgraph.edges)} call relationship(s) across {file_text}. {_node_intent(root)}"
+        f"This flow explains why `{root.name}` matters in the runtime rather than only listing calls. "
+        f"It starts at `{root.file_path}:{root.start_line}`, expands to {len(ordered)} function(s), and "
+        f"connects {len(subgraph.edges)} call relationship(s) across {file_text}. {_runtime_story_reason(root)}."
     )
 
 
@@ -734,9 +1088,25 @@ def _walkthrough_sentence(
     )
     extra = "" if len(calls) <= 5 else f", plus {len(calls) - 5} more"
     return (
-        f"{link} handles {_intent_noun(node)} and then delegates to {call_links}{extra}. "
-        f"Evidence: `{node.file_path}:{node.start_line}`."
+        f"{link} handles {_intent_noun(node)} and moves the flow into {call_links}{extra}. "
+        f"{_runtime_story_reason(node)}. Evidence: `{node.file_path}:{node.start_line}`."
     )
+
+
+def _flow_failure_shutdown_lines(ordered: list[SymbolNode], symbol_paths: dict[str, Path]) -> list[str]:
+    selected = [
+        node
+        for node in ordered
+        if any(token in node.name.lower() for token in ("fail", "error", "stop", "shutdown", "fini", "cleanup", "exit", "return"))
+    ]
+    if not selected:
+        return ["- No explicit failure or shutdown step was named in this expanded flow; inspect return-value checks in the source ranges linked above."]
+    lines: list[str] = []
+    for node in selected[:8]:
+        lines.append(
+            f"- [{node.name}]({_relative_symbol_from_flow(node, symbol_paths)}) - {_runtime_story_reason(node)}. Evidence: `{node.file_path}:{node.start_line}`."
+        )
+    return lines
 
 
 def _module_responsibility_lines(
@@ -760,6 +1130,55 @@ def _module_responsibility_lines(
             f"It has {outgoing[node.id]} internal call(s) in this module. Evidence: `{node.file_path}:{node.start_line}`."
         )
     return lines or ["- No responsibilities were identified from this module."]
+
+
+def _important_internal_path_lines(
+    module: str,
+    nodes: list[SymbolNode],
+    outgoing: dict[str, list[CodeEdge]],
+    symbol_paths: dict[str, Path],
+    module_paths: dict[str, Path],
+) -> list[str]:
+    ranked = sorted(nodes, key=lambda node: (-_name_concept_score(node), node.file_path, node.start_line, node.id))
+    lines: list[str] = []
+    for node in ranked:
+        if len(lines) >= 6:
+            break
+        callees = [
+            edge.dst_id
+            for edge in outgoing.get(node.id, [])
+            if any(candidate.id == edge.dst_id for candidate in nodes)
+        ]
+        if not callees and _name_concept_score(node) < 15:
+            continue
+        rel = _relative_symbol_from_module(module, node, symbol_paths, module_paths)
+        lines.append(f"- [{node.name}]({rel}) - {_runtime_story_reason(node)} Evidence: `{node.file_path}:{node.start_line}`.")
+    return lines
+
+
+def _balanced_module_evidence(nodes: list[SymbolNode], *, limit: int) -> list[SymbolNode]:
+    by_file = _file_clusters(nodes)
+    selected: list[SymbolNode] = []
+    for file_nodes in by_file.values():
+        ranked = sorted(file_nodes, key=lambda node: (-_name_concept_score(node), node.start_line, node.id))
+        selected.extend(ranked[:3])
+    seen = {node.id for node in selected}
+    for node in sorted(nodes, key=lambda node: (-_name_concept_score(node), node.file_path, node.start_line, node.id)):
+        if len(selected) >= limit:
+            break
+        if node.id not in seen:
+            selected.append(node)
+            seen.add(node.id)
+    return selected[:limit]
+
+
+def _module_prompt_anchor_lines(nodes: list[SymbolNode]) -> list[str]:
+    lines: list[str] = []
+    for file_path, file_nodes in _file_clusters(nodes).items():
+        anchors = sorted(file_nodes, key=lambda node: (-_name_concept_score(node), node.start_line, node.id))[:4]
+        anchor_text = ", ".join(f"{node.name} `{node.file_path}:{node.start_line}`" for node in anchors)
+        lines.append(f"- `{file_path}` ({_file_role(file_path, file_nodes)}): {anchor_text}")
+    return lines or ["- (none)"]
 
 
 def _module_boundary_summary(
@@ -794,6 +1213,59 @@ def _architecture_summary(modules: dict[str, list[SymbolNode]], flow_roots: list
     )
 
 
+# Ordered subarea rules for large single-file modules. A symbol joins the first
+# subarea whose keyword it matches, so ordering matters: "Thread movement" is
+# checked before "Scheduler hooks" so `_reactor_schedule_thread` (both "schedul"
+# and "thread") lands in thread movement, matching how reactor.c actually reads.
+_MODULE_SUBAREA_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Reactor lifecycle", ("reactors_init", "reactors_start", "reactors_stop", "reactors_fini", "reactor_construct", "reactor_deinit")),
+    ("Event queue", ("event_allocate", "event_call", "event_queue", "run_batch")),
+    ("Runtime loop", ("reactor_run", "_reactor_run", "interrupt_run", "reactor_interrupt")),
+    ("Thread movement", ("thread", "reschedule", "migrat")),
+    ("Scheduler hooks", ("schedul",)),
+)
+
+_MODULE_SUBAREA_MIN_SYMBOLS = 40
+
+
+def _module_subarea_lines(
+    module: str,
+    nodes: list[SymbolNode],
+    symbol_paths: dict[str, Path],
+    module_paths: dict[str, Path],
+) -> list[str]:
+    """Group a large module's symbols into deterministic reading subareas.
+
+    Only fires for modules above ~40 symbols, where a flat symbol list is too
+    long to navigate. Subareas are keyword-derived, so they stay reproducible
+    and need no LLM. Subareas with fewer than two members are dropped to avoid
+    noise, and a section is only emitted when at least two subareas survive.
+    """
+    if len(nodes) <= _MODULE_SUBAREA_MIN_SYMBOLS:
+        return []
+
+    groups: dict[str, list[SymbolNode]] = {label: [] for label, _ in _MODULE_SUBAREA_RULES}
+    for node in nodes:
+        lowered = node.name.lower()
+        for label, keywords in _MODULE_SUBAREA_RULES:
+            if any(keyword in lowered for keyword in keywords):
+                groups[label].append(node)
+                break
+
+    populated = [(label, members) for label, members in groups.items() if len(members) >= 2]
+    if len(populated) < 2:
+        return []
+
+    lines: list[str] = []
+    for label, members in populated:
+        links = ", ".join(
+            f"[{node.name}]({_relative_symbol_from_module(module, node, symbol_paths, module_paths)})"
+            for node in sorted(members, key=_node_sort_key)[:8]
+        )
+        lines.append(f"- **{label}**: {links}.")
+    return lines
+
+
 def _module_summary(
     module: str,
     nodes: list[SymbolNode],
@@ -819,6 +1291,91 @@ def _module_summary(
         f"{display} contains {len(nodes)} symbols and {len(internal_edges)} internal calls. "
         f"{boundary} Start from the reading path below, then use the symbol list as reference. Source evidence begins at {evidence}."
     )
+
+
+def _symbol_what_it_does(
+    graph: CodeGraph,
+    node: SymbolNode,
+    incoming: list[CodeEdge],
+    outgoing: list[CodeEdge],
+) -> str:
+    return "\n".join(_deterministic_symbol_bullets(graph, node, incoming, outgoing))
+
+
+def _deterministic_symbol_bullets(
+    graph: CodeGraph,
+    node: SymbolNode,
+    incoming: list[CodeEdge],
+    outgoing: list[CodeEdge],
+) -> list[str]:
+    name = node.name.lower()
+    bullets: list[str] = []
+    bullets.extend(_known_symbol_bullets(node))
+    if not bullets:
+        bullets.append(f"- `{node.name}` handles {_intent_noun(node)}. {_node_intent(node)} Evidence: `{node.file_path}:{node.start_line}`.")
+    if outgoing:
+        callees = [graph.nodes[edge.dst_id] for edge in outgoing if edge.dst_id in graph.nodes]
+        names = ", ".join(f"`{callee.name}`" for callee in sorted(callees, key=_node_sort_key)[:5])
+        bullets.append(f"- Its control flow continues through {names}, so those callees define the next concrete behavior. Evidence: `{node.file_path}:{node.start_line}`.")
+    elif "run" in name or "start" in name:
+        bullets.append(f"- The call graph has no expanded callees here, so inspect the source body for loop branches and return-code handling. Evidence: `{node.file_path}:{node.start_line}`.")
+    if incoming:
+        callers = [graph.nodes[edge.src_id] for edge in incoming if edge.src_id in graph.nodes]
+        names = ", ".join(f"`{caller.name}`" for caller in sorted(callers, key=_node_sort_key)[:5])
+        bullets.append(f"- It is reached from {names}, which gives the entry context for why this code runs. Evidence: `{node.file_path}:{node.start_line}`.")
+    if any(token in name for token in ("fail", "error", "shutdown", "stop", "fini", "cleanup")):
+        bullets.append(f"- Failure or shutdown relevance is signaled by the symbol name; check this page before changing cleanup ordering. Evidence: `{node.file_path}:{node.start_line}`.")
+    return bullets[:4]
+
+
+def _known_flow_phase_lines(root: SymbolNode) -> list[str]:
+    """Explicit branch/failure/shutdown phase narrative for load-bearing flows.
+
+    The generic walkthrough lists callees but not control-flow meaning. For the
+    two flows a reader most needs to understand, spell out the phases (branches,
+    blocking handoff, return-code and shutdown behavior) grounded in the root
+    location. Returns [] for every other root, which keeps the generic
+    walkthrough as the default.
+    """
+    cite = f"`{root.file_path}:{root.start_line}`"
+    if root.name == "spdk_app_start":
+        return [
+            f"1. Validation and options copy: it rejects an unusable options struct and copies caller options into runtime state before anything starts. Evidence: {cite}.",
+            f"2. Environment and signal setup: it prepares the SPDK environment, signal handlers, and tracing so the runtime can come up safely. Evidence: {cite}.",
+            f"3. Reactor initialization: it builds per-core reactor state via the reactor-init path before any work is dispatched. Evidence: {cite}.",
+            f"4. Blocking runtime handoff: it starts the reactors and blocks here while they run, so this call does not return during normal operation. Evidence: {cite}.",
+            f"5. Shutdown and return code: on init failure it returns non-zero early without running, and on normal stop it returns after the reactor loop drains. Evidence: {cite}.",
+        ]
+    if root.name == "reactor_run":
+        return [
+            f"1. Mode branch: each iteration takes either the poller (busy-poll) branch or the interrupt branch depending on the reactor's interrupt mode. Evidence: {cite}.",
+            f"2. Event and poller work: it drains the event queue and runs registered pollers for the threads on this core. Evidence: {cite}.",
+            f"3. Scheduler metrics trigger: on the scheduler period it gathers per-thread load metrics that later drive rebalancing. Evidence: {cite}.",
+            f"4. Lightweight-thread cleanup: it post-processes and removes lightweight threads that have exited or migrated. Evidence: {cite}.",
+            f"5. Shutdown drain: when a stop is requested it stops looping and lets remaining work drain so the core can exit cleanly. Evidence: {cite}.",
+        ]
+    return []
+
+
+def _known_symbol_bullets(node: SymbolNode) -> list[str]:
+    name = node.name
+    cite = f"`{node.file_path}:{node.start_line}`"
+    if name == "spdk_app_start":
+        return [
+            f"- `spdk_app_start` is the application bootstrap path: it validates startup inputs, prepares environment/runtime state, and hands execution to the reactor layer. Evidence: {cite}.",
+            f"- It is important because the function typically blocks while reactors run, so its return path represents shutdown or startup failure completion. Evidence: {cite}.",
+        ]
+    if name == "reactor_run":
+        return [
+            f"- `reactor_run` is a reactor execution loop where polling, interrupt-mode decisions, scheduler metric collection, and shutdown cleanup meet. Evidence: {cite}.",
+            f"- It is the page to read when changing event dispatch latency, interrupt behavior, or shutdown drain ordering. Evidence: {cite}.",
+        ]
+    if name == "rpc_framework_get_reactors":
+        return [
+            f"- `rpc_framework_get_reactors` is a JSON-RPC control-plane entry point for reactor introspection. Evidence: {cite}.",
+            f"- It matters because it fans out over reactor state and aggregates response data for external management clients. Evidence: {cite}.",
+        ]
+    return []
 
 
 def _symbol_role(node: SymbolNode, incoming: list[CodeEdge], outgoing: list[CodeEdge]) -> str:
@@ -880,6 +1437,10 @@ def _flow_order(graph: CodeGraph, root_id: str) -> list[SymbolNode]:
 
 
 def _module_indexes(nodes: list[SymbolNode]) -> dict[str, list[SymbolNode]]:
+    flat_domain_modules = _flat_domain_modules(nodes)
+    if flat_domain_modules is not None:
+        return flat_domain_modules
+
     modules: dict[str, list[SymbolNode]] = {}
     for node in nodes:
         modules.setdefault(_module_name(node.file_path), []).append(node)
@@ -887,6 +1448,47 @@ def _module_indexes(nodes: list[SymbolNode]) -> dict[str, list[SymbolNode]]:
         module: sorted(module_nodes, key=_node_sort_key)
         for module, module_nodes in sorted(modules.items())
     }
+
+
+def _flat_domain_modules(nodes: list[SymbolNode]) -> dict[str, list[SymbolNode]] | None:
+    if len(nodes) < 8:
+        return None
+    paths = [Path(node.file_path) for node in nodes]
+    if any(len(path.parts) > 1 for path in paths):
+        return None
+    source_files = {path.name for path in paths if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}}
+    if len(source_files) < 4:
+        return None
+
+    modules: dict[str, list[SymbolNode]] = {}
+    for node in nodes:
+        modules.setdefault(_domain_module_name(node), []).append(node)
+    if len(modules) < 4:
+        return None
+    return {
+        module: sorted(module_nodes, key=_node_sort_key)
+        for module, module_nodes in sorted(modules.items())
+    }
+
+
+def _domain_module_name(node: SymbolNode) -> str:
+    text = f"{Path(node.file_path).stem} {node.name}".lower()
+    if "app_rpc" in text or "log_rpc" in text or "rpc" in text:
+        return "RPC Control Plane"
+    if "reactor" in text or "event_queue" in text:
+        return "Reactor Runtime"
+    if "scheduler" in text or "balance" in text:
+        return "Scheduler Policy"
+    if "app" in text or any(token in text for token in ("subsystem", "opts", "shutdown", "start")):
+        return "Application Lifecycle"
+    return _title_from_file_stem(node.file_path)
+
+
+def _title_from_file_stem(file_path: str) -> str:
+    stem = Path(file_path).stem.replace("_", " ").replace("-", " ").strip()
+    if not stem:
+        return "Root Module"
+    return " ".join(part.capitalize() for part in stem.split())
 
 
 def _module_name(file_path: str) -> str:

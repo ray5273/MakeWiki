@@ -10,12 +10,12 @@ from makewiki.analysis import ClangdAnalyzer, FixtureAnalyzer, JoernAnalyzer
 from makewiki.analysis.docs import build_doc_index
 from makewiki.build import discover_compile_commands
 from makewiki.config import load_config
-from makewiki.errors import GraphError, MakeWikiError
+from makewiki.errors import GraphError, MakeWikiError, WikiValidationError
 from makewiki.graph import GraphStore, extract_subgraph
-from makewiki.llm import OPENROUTER_LOCKED_MODEL, RateLimitedLLMClient, openrouter_from_env
+from makewiki.llm import OPENROUTER_DEFAULT_MODELS, RateLimitedLLMClient, openrouter_from_env
 from makewiki.qa import QAOptions, answer_question, format_answer
 from makewiki.render import render_mermaid
-from makewiki.wiki import generate_wiki, validate_wiki
+from makewiki.wiki import evaluate_wiki, generate_wiki, validate_wiki
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_wiki(args)
         if args.command == "wiki" and args.wiki_command == "validate":
             return _cmd_wiki_validate(args)
+        if args.command == "wiki" and args.wiki_command == "evaluate":
+            return _cmd_wiki_evaluate(args)
+        if args.command == "wiki" and args.wiki_command == "test":
+            return _cmd_wiki_test(args)
     except MakeWikiError as exc:
         print(f"makewiki: error: {exc}", file=sys.stderr)
         return 2
@@ -98,13 +102,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wiki_generate.add_argument("--analyzer", choices=["fixture", "clangd", "joern"], default="joern")
     wiki_generate.add_argument("--llm", choices=["none", "openrouter"], default="none")
+    wiki_generate.add_argument("--llm-scope", choices=["modules", "symbols", "all"], default="modules")
     wiki_generate.add_argument("--llm-model")
     wiki_generate.add_argument("--llm-rpm", type=int, default=20)
+    wiki_generate.add_argument("--repair-attempts", type=int, default=0)
 
     wiki_validate = wiki_sub.add_parser("validate")
     wiki_validate.add_argument("repo")
     wiki_validate.add_argument("--wiki", default=".makewiki/wiki")
     wiki_validate.add_argument("--graph-out", default=".makewiki/out")
+
+    wiki_evaluate = wiki_sub.add_parser("evaluate")
+    wiki_evaluate.add_argument("wiki")
+    wiki_evaluate.add_argument("--report", help="write the full markdown report to this path")
+
+    wiki_test = wiki_sub.add_parser("test")
+    wiki_test.add_argument("repo")
+    wiki_test.add_argument("--wiki", default=".makewiki/wiki")
+    wiki_test.add_argument("--graph-out", default=".makewiki/out")
+    wiki_test.add_argument("--report", help="write the full markdown report to this path")
+    wiki_test.add_argument("--min-pass-rate", type=float, default=1.0)
 
     return parser
 
@@ -119,7 +136,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         _doctor_check("clangd", shutil.which("clangd") is not None, shutil.which("clangd") or "not found", "install clangd or use --analyzer joern"),
         _doctor_check("compile_commands", (repo_root / "compile_commands.json").is_file(), str(repo_root / "compile_commands.json"), "generate compile_commands.json for clangd analysis"),
         _doctor_check("openrouter_key", bool(os.environ.get("OPENROUTER_API_KEY")), "set" if os.environ.get("OPENROUTER_API_KEY") else "not set", "export OPENROUTER_API_KEY for --llm openrouter"),
-        _doctor_check("openrouter_model", True, OPENROUTER_LOCKED_MODEL, "pass the locked model with --llm-model or omit --llm-model"),
+        _doctor_check("openrouter_model", True, " -> ".join(OPENROUTER_DEFAULT_MODELS), "omit --llm-model to use the free fallback chain, or pass one model with --llm-model"),
     ]
 
     width = max(len(check.name) for check in checks)
@@ -232,7 +249,16 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
     llm_client = _llm_client(args.llm, args.llm_model, args.llm_rpm)
     doc_roots = [Path(root).resolve() for root in args.doc_root]
     docs = build_doc_index(repo_root, extra_roots=doc_roots)
-    pages = generate_wiki(graph, config, out_path, max_depth=args.depth, llm_client=llm_client, docs=docs)
+    pages = generate_wiki(
+        graph,
+        config,
+        out_path,
+        max_depth=args.depth,
+        llm_client=llm_client,
+        llm_scope=args.llm_scope,
+        docs=docs,
+        repair_attempts=args.repair_attempts,
+    )
     print(f"wiki: {out_path}")
     print(f"pages: {len(pages)}")
     print(f"doc comments: {len(docs)}")
@@ -262,6 +288,82 @@ def _cmd_wiki_validate(args: argparse.Namespace) -> int:
         wiki_path = repo_root / wiki_path
     validate_wiki(graph, wiki_path)
     print(f"valid wiki: {wiki_path}")
+    return 0
+
+
+def _cmd_wiki_evaluate(args: argparse.Namespace) -> int:
+    wiki_path = Path(args.wiki).resolve()
+    if not (wiki_path / "symbols").is_dir():
+        raise WikiValidationError(f"no symbols/ directory under {wiki_path}")
+
+    evaluation = evaluate_wiki(wiki_path)
+    graded = evaluation.summary_pages
+    counts = evaluation.counts_by_category()
+
+    print(f"wiki: {wiki_path}")
+    print(f"summary pages: {len(graded)}")
+    print(f"pass rate: {evaluation.pass_rate() * 100:.0f}%")
+    if counts:
+        for category in sorted(counts, key=lambda c: (-counts[c], c)):
+            print(f"  {category}: {counts[category]}")
+    else:
+        print("  no findings")
+
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(evaluation.report(), encoding="utf-8")
+        print(f"report: {report_path}")
+    return 0
+
+
+def _cmd_wiki_test(args: argparse.Namespace) -> int:
+    if args.min_pass_rate < 0 or args.min_pass_rate > 1:
+        raise WikiValidationError("--min-pass-rate must be between 0 and 1")
+
+    repo_root = Path(args.repo).resolve()
+    store_path = _resolve_store_path(repo_root, args.graph_out)
+    if not store_path.exists():
+        raise GraphError(f"graph store not found: {store_path}")
+    with GraphStore(store_path) as store:
+        graph = store.load_graph(repo_root)
+
+    wiki_path = Path(args.wiki)
+    if not wiki_path.is_absolute():
+        wiki_path = repo_root / wiki_path
+    if not wiki_path.is_dir():
+        raise WikiValidationError(f"wiki directory does not exist: {wiki_path}")
+
+    validation_issues = validate_wiki(graph, wiki_path, raise_on_error=False)
+    evaluation = evaluate_wiki(wiki_path)
+    counts = evaluation.counts_by_category()
+    pass_rate = evaluation.pass_rate()
+
+    print(f"wiki: {wiki_path}")
+    print(f"validation issues: {len(validation_issues)}")
+    print(f"summaries evaluated: {len(evaluation.summary_pages)}")
+    print(f"pass rate: {pass_rate * 100:.0f}%")
+    print(f"document pages checked: {len(evaluation.document_pages)}")
+    print(f"document findings: {len(evaluation.document_findings)}")
+    if counts:
+        for category in sorted(counts, key=lambda c: (-counts[c], c)):
+            print(f"  {category}: {counts[category]}")
+    else:
+        print("  no findings")
+
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [evaluation.report()]
+        if validation_issues:
+            lines.extend(["", "## Validation issues", ""])
+            for issue in validation_issues:
+                lines.append(f"- `{issue.page}`: {issue.message}")
+        report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        print(f"report: {report_path}")
+
+    if validation_issues or pass_rate < args.min_pass_rate:
+        return 2
     return 0
 
 
