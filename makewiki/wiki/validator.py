@@ -45,7 +45,9 @@ def validate_wiki(
     for page in pages:
         text = page.read_text(encoding="utf-8")
         citations = list(CODE_CITATION_RE.finditer(text))
-        if page.name != "index.md" and not citations:
+        # data-model.md documents structs (parsed from source, not graph
+        # symbols), so it carries no graph-backed citations by design.
+        if page.name not in {"index.md", "data-model.md"} and not citations:
             issues.append(WikiValidationIssue(page, "page has no file:line evidence citations"))
 
         for match in citations:

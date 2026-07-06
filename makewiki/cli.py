@@ -8,6 +8,7 @@ from pathlib import Path
 
 from makewiki.analysis import ClangdAnalyzer, FixtureAnalyzer, JoernAnalyzer
 from makewiki.analysis.docs import build_doc_index
+from makewiki.analysis.structs import build_struct_index
 from makewiki.build import discover_compile_commands
 from makewiki.config import load_config
 from makewiki.errors import GraphError, MakeWikiError, WikiValidationError
@@ -249,6 +250,7 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
     llm_client = _llm_client(args.llm, args.llm_model, args.llm_rpm)
     doc_roots = [Path(root).resolve() for root in args.doc_root]
     docs = build_doc_index(repo_root, extra_roots=doc_roots)
+    structs = build_struct_index(repo_root, extra_roots=doc_roots)
     pages = generate_wiki(
         graph,
         config,
@@ -257,11 +259,13 @@ def _cmd_wiki(args: argparse.Namespace) -> int:
         llm_client=llm_client,
         llm_scope=args.llm_scope,
         docs=docs,
+        structs=structs,
         repair_attempts=args.repair_attempts,
     )
     print(f"wiki: {out_path}")
     print(f"pages: {len(pages)}")
     print(f"doc comments: {len(docs)}")
+    print(f"structs indexed: {len(structs)}")
     return 0
 
 

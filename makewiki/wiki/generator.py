@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from makewiki.analysis.structs import StructDef
 from makewiki.config import MakeWikiConfig
 from makewiki.graph import CodeEdge, CodeGraph, DocComment, SymbolNode, extract_subgraph
 from makewiki.llm import LLMClient
@@ -28,6 +29,7 @@ def generate_wiki(
     llm_client: LLMClient | None = None,
     llm_scope: str = "modules",
     docs: dict[str, DocComment] | None = None,
+    structs: dict[str, StructDef] | None = None,
     repair_attempts: int = 0,
 ) -> list[WikiPage]:
     """Write deterministic graph-backed Markdown wiki pages."""
@@ -35,6 +37,7 @@ def generate_wiki(
         raise ValueError("repair_attempts must be >= 0")
 
     docs = docs or {}
+    structs = structs or {}
 
     output_root = Path(out_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -86,6 +89,12 @@ def generate_wiki(
     reference_path.write_text(_render_reference(nodes, symbol_paths), encoding="utf-8")
     pages.append(WikiPage(path=reference_path, title="Symbol Reference"))
 
+    referenced_structs = _referenced_structs(nodes, structs)
+    if referenced_structs:
+        data_model_path = output_root / "data-model.md"
+        data_model_path.write_text(_render_data_model(referenced_structs, nodes), encoding="utf-8")
+        pages.append(WikiPage(path=data_model_path, title="Data Model"))
+
     for root in flow_roots:
         path = flow_paths[root.id]
         path.write_text(
@@ -133,6 +142,7 @@ def generate_wiki(
                 doc=docs.get(node.name),
                 llm_client=llm_client if llm_scope in {"symbols", "all"} else None,
                 repair_attempts=repair_attempts,
+                structs=structs,
             ),
             encoding="utf-8",
         )
@@ -261,6 +271,77 @@ def _render_index(
         lines.append("- No module pages were generated.")
     lines.append("")
     return "\n".join(lines)
+
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _signature_struct_names(signature: str | None, structs: dict[str, StructDef]) -> list[str]:
+    """Struct names (from the index) that appear in a symbol's signature."""
+    if not signature:
+        return []
+    seen: list[str] = []
+    for token in _IDENTIFIER_RE.findall(signature):
+        if token in structs and token not in seen:
+            seen.append(token)
+    return seen
+
+
+def _referenced_structs(
+    nodes: list[SymbolNode], structs: dict[str, StructDef]
+) -> dict[str, StructDef]:
+    """Keep only structs referenced by an analyzed symbol's signature.
+
+    The header trees pull in hundreds of system/third-party structs; the data
+    model a reader cares about is the set the analyzed functions actually take
+    or return. Ordered by name for deterministic output.
+    """
+    if not structs:
+        return {}
+    referenced: set[str] = set()
+    for node in nodes:
+        referenced.update(_signature_struct_names(node.signature, structs))
+    return {name: structs[name] for name in sorted(referenced)}
+
+
+def _render_data_model(structs: dict[str, StructDef], nodes: list[SymbolNode]) -> str:
+    """Render the data-model page: each referenced struct with its fields.
+
+    Struct locations are shown as plain-text `file:line` (no backtick citation)
+    because structs are parsed from source, not graph symbols, so they are not
+    part of the graph-citation validation surface. Fields are verbatim from the
+    definition, keeping the page accurate.
+    """
+    lines = [
+        "# Data Model",
+        "",
+        "Key data structures the analyzed functions operate on, parsed from source. "
+        "Each struct lists its fields and where it is defined.",
+        "",
+    ]
+    # Map struct name -> functions whose signature references it, for cross-links.
+    users: dict[str, list[str]] = {name: [] for name in structs}
+    for node in nodes:
+        for name in _signature_struct_names(node.signature, structs):
+            users[name].append(node.name)
+
+    for name, struct in structs.items():
+        lines.append(f"## struct {name}")
+        lines.append("")
+        lines.append(f"Defined at {struct.file_path}:{struct.start_line} (lines {struct.start_line}-{struct.end_line}).")
+        lines.append("")
+        if struct.fields:
+            lines.append("Fields:")
+            lines.append("")
+            for field_def in struct.fields:
+                lines.append(f"- `{field_def.type} {field_def.name}`")
+            lines.append("")
+        symbol_users = users.get(name, [])
+        if symbol_users:
+            listed = ", ".join(f"`{fn}`" for fn in sorted(dict.fromkeys(symbol_users))[:8])
+            lines.append(f"Used by: {listed}.")
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _render_reference(nodes: list[SymbolNode], symbol_paths: dict[str, Path]) -> str:
@@ -668,6 +749,7 @@ def _render_symbol_page(
     doc: DocComment | None = None,
     llm_client: LLMClient | None = None,
     repair_attempts: int = 0,
+    structs: dict[str, StructDef] | None = None,
 ) -> str:
     subgraph = extract_subgraph(graph, node.id, max_depth, edge_types={"calls"})
     role = _symbol_role(node, incoming, outgoing)
@@ -722,6 +804,13 @@ def _render_symbol_page(
         lines.append(f"- Signature: `{node.signature}`")
     if node.end_line is not None:
         lines.append(f"- Range: `{node.file_path}:{node.start_line}-{node.end_line}`")
+
+    struct_names = _signature_struct_names(node.signature, structs or {})
+    if struct_names:
+        lines.extend(["", "## Data Structures", "", "This function's signature references these data structures (see the [Data Model](../data-model.md) page):", ""])
+        for name in struct_names:
+            struct = structs[name]  # type: ignore[index]
+            lines.append(f"- [`struct {name}`](../data-model.md) — {len(struct.fields)} field(s), defined at {struct.file_path}:{struct.start_line}.")
 
     lines.extend(
         [

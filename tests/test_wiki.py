@@ -23,6 +23,47 @@ def _node(name: str) -> SymbolNode:
     return SymbolNode(id=name, name=name, kind="function", file_path="app.c", start_line=1)
 
 
+def test_generate_wiki_renders_data_model_and_symbol_struct_links(tmp_path):
+    from makewiki.analysis.structs import StructDef, StructField
+
+    config = load_config(ROOT)
+    graph = FixtureAnalyzer().analyze(ROOT.resolve(), config).graph
+    # handle_request in the fixture has a signature; give it a struct to reference.
+    handle = next(n for n in graph.nodes.values() if n.name == "handle_request")
+    object.__setattr__(handle, "signature", "int(struct request*)")
+    structs = {
+        "request": StructDef(
+            name="request",
+            file_path="main.c",
+            start_line=3,
+            end_line=6,
+            fields=(StructField("int", "id"), StructField("char *", "body")),
+        )
+    }
+
+    generate_wiki(graph, config, tmp_path, max_depth=3, structs=structs)
+
+    data_model = (tmp_path / "data-model.md").read_text(encoding="utf-8")
+    assert "## struct request" in data_model
+    assert "`int id`" in data_model
+    assert "Used by: `handle_request`" in data_model
+
+    handle_page = (tmp_path / "symbols" / "main.c-handle_request.md").read_text(encoding="utf-8")
+    assert "## Data Structures" in handle_page
+    assert "[`struct request`](../data-model.md)" in handle_page
+    # Unreferenced structs stay out; validation still passes.
+    assert validate_wiki(graph, tmp_path) == []
+
+
+def test_generate_wiki_skips_data_model_when_no_referenced_structs(tmp_path):
+    config = load_config(ROOT)
+    graph = FixtureAnalyzer().analyze(ROOT.resolve(), config).graph
+
+    generate_wiki(graph, config, tmp_path, max_depth=3, structs={})
+
+    assert not (tmp_path / "data-model.md").exists()
+
+
 def test_runtime_story_reason_classifies_app_start_shutdown_as_shutdown():
     # `app_start_shutdown` contains "app_start" but is teardown: shutdown wins.
     reason = _runtime_story_reason(_node("app_start_shutdown"))
