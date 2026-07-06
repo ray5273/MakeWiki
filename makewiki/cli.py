@@ -17,6 +17,7 @@ from makewiki.llm import OPENROUTER_DEFAULT_MODELS, RateLimitedLLMClient, openro
 from makewiki.qa import QAOptions, answer_question, format_answer
 from makewiki.render import render_mermaid
 from makewiki.wiki import evaluate_wiki, generate_wiki, validate_wiki
+from makewiki.wiki.html import build_html_site
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_wiki_validate(args)
         if args.command == "wiki" and args.wiki_command == "evaluate":
             return _cmd_wiki_evaluate(args)
+        if args.command == "wiki" and args.wiki_command == "html":
+            return _cmd_wiki_html(args)
         if args.command == "wiki" and args.wiki_command == "test":
             return _cmd_wiki_test(args)
     except MakeWikiError as exc:
@@ -116,6 +119,10 @@ def _build_parser() -> argparse.ArgumentParser:
     wiki_evaluate = wiki_sub.add_parser("evaluate")
     wiki_evaluate.add_argument("wiki")
     wiki_evaluate.add_argument("--report", help="write the full markdown report to this path")
+
+    wiki_html = wiki_sub.add_parser("html")
+    wiki_html.add_argument("wiki")
+    wiki_html.add_argument("--out", required=True, help="output directory for the HTML site")
 
     wiki_test = wiki_sub.add_parser("test")
     wiki_test.add_argument("repo")
@@ -318,6 +325,20 @@ def _cmd_wiki_evaluate(args: argparse.Namespace) -> int:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(evaluation.report(), encoding="utf-8")
         print(f"report: {report_path}")
+    return 0
+
+
+def _cmd_wiki_html(args: argparse.Namespace) -> int:
+    wiki_path = Path(args.wiki).resolve()
+    if not wiki_path.is_dir():
+        raise WikiValidationError(f"wiki directory does not exist: {wiki_path}")
+    out_path = Path(args.out).resolve()
+    pages = build_html_site(wiki_path, out_path)
+    index_html = out_path / "index.html"
+    print(f"site: {out_path}")
+    print(f"pages: {len(pages)}")
+    if index_html.exists():
+        print(f"open: file://{index_html}")
     return 0
 
 
