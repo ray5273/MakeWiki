@@ -159,6 +159,12 @@ def _citations(text: str) -> list[str]:
     return _CITATION_TOKEN.findall(text)
 
 
+# Sections that must carry explicit `file:line` citations, not just a symbol
+# name. The concept narrative is the one the user asked to be citation-enforced,
+# so name-only grounding is not enough there.
+_CITATION_REQUIRED_SECTIONS = {"Concept"}
+
+
 def evaluate_summary_text(
     *,
     page: str,
@@ -196,6 +202,12 @@ def evaluate_summary_text(
         if _REASONING_MARKERS.search(line):
             findings.append(finding("reasoning-leak", line.strip()[:120]))
             break
+
+    bullets = [line for line in summary.splitlines() if line.lstrip().startswith("- ")]
+    if section in _CITATION_REQUIRED_SECTIONS and bullets:
+        uncited = sum(1 for line in bullets if not _citations(line))
+        if uncited:
+            findings.append(finding("missing-citation", f"{uncited} of {len(bullets)} bullets lack a `file:line` citation"))
 
     anchors = anchor_names or set()
     if not cited and not any(anchor and anchor in summary for anchor in anchors):
@@ -242,6 +254,7 @@ def evaluate_wiki(wiki_dir: Path) -> WikiEvaluation:
     symbols_dir = Path(wiki_dir) / "symbols"
     modules_dir = Path(wiki_dir) / "modules"
     pages = [evaluate_page(p, page_type="module", section="LLM Summary") for p in sorted(modules_dir.glob("*.md"))]
+    pages.extend(evaluate_page(p, page_type="module", section="Concept") for p in sorted(modules_dir.glob("*.md")))
     pages.extend(evaluate_page(p, page_type="symbol", section="Summary") for p in sorted(symbols_dir.glob("*.md")))
     pages.extend(_evaluate_what_it_does(p) for p in sorted(symbols_dir.glob("*.md")))
     pages.extend(_evaluate_module_quality(p) for p in sorted(modules_dir.glob("*.md")))

@@ -9,10 +9,12 @@ from makewiki.wiki import generate_wiki, validate_wiki
 from makewiki.wiki.generator import (
     _SUMMARY_FALLBACK,
     _dedupe_citations,
+    _architecture_diagram,
     _known_flow_phase_lines,
     _module_indexes,
     _module_subarea_lines,
     _normalize_llm_summary,
+    _runtime_sequence_diagram,
     _runtime_story_reason,
 )
 
@@ -31,6 +33,45 @@ def test_runtime_story_reason_classifies_app_start_shutdown_as_shutdown():
 def test_runtime_story_reason_keeps_startup_for_spdk_app_start():
     reason = _runtime_story_reason(_node("spdk_app_start"))
     assert "blocking event runtime" in reason
+
+
+def test_architecture_diagram_shows_cross_module_edges():
+    graph = CodeGraph(repo_root=Path("."))
+    nodes = [
+        SymbolNode("app:start", "spdk_app_start", "function", "app.c", 10),
+        SymbolNode("app:shutdown", "app_start_shutdown", "function", "app.c", 80),
+        SymbolNode("reactor:init", "spdk_reactors_init", "function", "reactor.c", 20),
+        SymbolNode("reactor:run", "reactor_run", "function", "reactor.c", 140),
+        SymbolNode("rpc:reactors", "rpc_framework_get_reactors", "function", "app_rpc.c", 30),
+        SymbolNode("rpc:log", "rpc_framework_get_log_flags", "function", "log_rpc.c", 50),
+        SymbolNode("sched:gather", "_reactors_scheduler_gather_metrics", "function", "scheduler_static.c", 70),
+        SymbolNode("sched:balance", "balance_static", "function", "scheduler_static.c", 120),
+    ]
+    for node in nodes:
+        graph.add_node(node)
+    graph.add_edge(CodeEdge("app:start", "reactor:init"))  # Application Lifecycle -> Reactor Runtime
+    modules = _module_indexes(nodes)
+
+    diagram = _architecture_diagram(modules, graph)
+
+    assert diagram.startswith("flowchart TD")
+    assert "Application Lifecycle" in diagram
+    assert "Reactor Runtime" in diagram
+    assert "1 call" in diagram  # cross-module edge counted
+
+
+def test_runtime_sequence_diagram_orders_file_handoffs():
+    nodes = [
+        SymbolNode("app:start", "spdk_app_start", "function", "app.c", 881),
+        SymbolNode("reactor:init", "spdk_reactors_init", "function", "reactor.c", 276),
+        SymbolNode("app:shutdown", "app_start_shutdown", "function", "app.c", 277),
+    ]
+
+    diagram = _runtime_sequence_diagram(nodes)
+
+    assert diagram.startswith("sequenceDiagram")
+    assert "participant" in diagram
+    assert "spdk_reactors_init (reactor.c:276)" in diagram
 
 
 def test_known_flow_phase_lines_describe_branch_and_shutdown():
@@ -337,10 +378,12 @@ def test_generate_wiki_can_add_llm_module_summary(tmp_path):
     generate_wiki(graph, config, tmp_path, max_depth=3, llm_client=llm)
 
     module_text = (tmp_path / "modules" / "root.md").read_text(encoding="utf-8")
+    assert "## Concept" in module_text
     assert "## LLM Summary" in module_text
     assert "Start with `main.c:12`" in module_text
     assert validate_wiki(graph, tmp_path) == []
-    assert len(llm.calls) == 1
+    # The module page now makes two LLM calls: the concept narrative and the summary.
+    assert len(llm.calls) == 2
     assert "Allowed citations:" in llm.calls[0][1]
 
 
@@ -415,6 +458,8 @@ def test_generate_wiki_repairs_bad_module_summary(tmp_path):
     graph = FixtureAnalyzer().analyze(ROOT.resolve(), config).graph
     llm = SequenceLLM(
         [
+            # First the (clean) concept narrative, then the summary repair sequence.
+            "- The root area drives request handling from `main.c:12`.",
             "- This cites an invented location (`main.c:999`).",
             "- Root dispatch starts at `main.c:12`.",
         ]
@@ -425,8 +470,8 @@ def test_generate_wiki_repairs_bad_module_summary(tmp_path):
     module_text = (tmp_path / "modules" / "root.md").read_text(encoding="utf-8")
     assert "Root dispatch starts" in module_text
     assert "main.c:999" not in module_text
-    assert len(llm.calls) == 2
-    assert "Previous draft failed quality audit" in llm.calls[1][1]
+    assert len(llm.calls) == 3
+    assert "Previous draft failed quality audit" in llm.calls[2][1]
 
 
 def test_generate_wiki_falls_back_after_repair_attempts_exhausted(tmp_path):
@@ -434,6 +479,8 @@ def test_generate_wiki_falls_back_after_repair_attempts_exhausted(tmp_path):
     graph = FixtureAnalyzer().analyze(ROOT.resolve(), config).graph
     llm = SequenceLLM(
         [
+            # Clean concept narrative first, then a summary that never passes audit.
+            "- The root area drives request handling from `main.c:12`.",
             "- This cites an invented location (`main.c:999`).",
             "- This still cites an invented location (`main.c:998`).",
         ]
@@ -443,4 +490,4 @@ def test_generate_wiki_falls_back_after_repair_attempts_exhausted(tmp_path):
 
     module_text = (tmp_path / "modules" / "root.md").read_text(encoding="utf-8")
     assert _SUMMARY_FALLBACK in module_text
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3

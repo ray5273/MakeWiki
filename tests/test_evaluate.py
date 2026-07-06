@@ -322,6 +322,32 @@ def test_what_it_does_with_anchors_is_clean(tmp_path):
     assert evaluation.document_findings == []
 
 
+def test_concept_section_requires_citations(tmp_path):
+    from makewiki.wiki.evaluate import evaluate_summary_text
+
+    # Named symbols but no file:line citation -> concept section must flag it.
+    uncited = evaluate_summary_text(
+        page="reactor-runtime",
+        page_type="module",
+        section="Concept",
+        summary="- The reactor runtime drives spdk_event_call across cores.",
+        allowed_citations={"reactor.c:987"},
+        anchor_names={"spdk_event_call"},
+    )
+    assert "missing-citation" in {f.category for f in uncited.findings}
+
+    cited = evaluate_summary_text(
+        page="reactor-runtime",
+        page_type="module",
+        section="Concept",
+        summary="- The reactor runtime drives events across cores (`reactor.c:987`).",
+        allowed_citations={"reactor.c:987"},
+        anchor_names={"spdk_event_call"},
+    )
+    assert "missing-citation" not in {f.category for f in cited.findings}
+    assert cited.clean
+
+
 def test_evaluate_summary_flags_shallow_summary(tmp_path):
     result = evaluate_page(
         _write_page(

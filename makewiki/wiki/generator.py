@@ -171,14 +171,37 @@ def _render_index(
         "",
         _architecture_summary(modules, flow_roots),
         "",
-        "## Major Subsystems",
-        "",
     ]
+    architecture_diagram = _architecture_diagram(modules, graph)
+    if architecture_diagram:
+        lines.extend([
+            "## Architecture",
+            "",
+            "How the code areas call into each other (each arrow is one or more cross-module calls in the graph).",
+            "",
+            "```mermaid",
+            architecture_diagram,
+            "```",
+            "",
+        ])
+    lines.extend(["## Major Subsystems", ""])
     lines.extend(_major_subsystem_lines(nodes))
     lines.extend(["", "## Subsystem Map", ""])
     lines.extend(_system_map_lines(nodes, modules, module_paths, outgoing))
     lines.extend(["", "## Runtime Story", ""])
     lines.extend(_runtime_story_lines(nodes, symbol_paths))
+    sequence_diagram = _runtime_sequence_diagram(nodes)
+    if sequence_diagram:
+        lines.extend([
+            "",
+            "## Runtime Sequence",
+            "",
+            "The main runtime path as a handoff between source files, in call order.",
+            "",
+            "```mermaid",
+            sequence_diagram,
+            "```",
+        ])
     lines.extend(["", "## Read by Task", ""])
     lines.extend(_read_by_task_lines(nodes, symbol_paths))
     lines.extend(
@@ -347,9 +370,20 @@ def _render_module_page(
         "",
         _module_summary(module, nodes, internal_edges, inbound_edges, outbound_edges),
         "",
-        "## Responsibilities",
-        "",
     ]
+    if llm_client is not None:
+        lines.extend(
+            [
+                "## Concept",
+                "",
+                _generate_module_concept(
+                    llm_client, module, nodes, internal_edges, inbound_edges, outbound_edges,
+                    repair_attempts=repair_attempts,
+                ),
+                "",
+            ]
+        )
+    lines.extend(["## Responsibilities", ""])
     lines.extend(_module_responsibility_lines(nodes, internal_edges, symbol_paths, module_paths, module))
     lines.extend(
         [
@@ -413,6 +447,74 @@ def _render_module_page(
         lines.append(f"- [{node.name}]({_relative_symbol_from_module(module, node, symbol_paths, module_paths)}) - `{node.file_path}:{node.start_line}`")
     lines.append("")
     return "\n".join(lines)
+
+
+def _generate_module_concept(
+    llm_client: LLMClient,
+    module: str,
+    nodes: list[SymbolNode],
+    internal_edges: list[CodeEdge],
+    inbound_edges: list[CodeEdge],
+    outbound_edges: list[CodeEdge],
+    *,
+    repair_attempts: int = 0,
+) -> str:
+    """Generate a grounded concept narrative for a module.
+
+    Unlike the terse LLM Summary, this explains the concept itself: what the
+    code area is, why it exists, and how its key symbols realize it. Every claim
+    is still pinned to a `file:line` citation and audited (the repair loop rejects
+    hallucinated citations and reasoning leaks) so the added narrative depth does
+    not cost accuracy.
+    """
+    evidence_nodes = _balanced_module_evidence(nodes, limit=40)
+    allowed_tokens = [f"{node.file_path}:{node.start_line}" for node in evidence_nodes[:24]]
+    allowed_citations = ", ".join(f"`{token}`" for token in allowed_tokens)
+    system = (
+        "You write explanatory code wiki documentation from provided graph evidence only. "
+        "Explain the concept: what this code area is, why it exists, and how its key "
+        "functions realize it. Do not invent files, functions, or call relationships. "
+        "Every non-trivial claim must include one of the provided `file:line` citations. "
+        "Return only final Markdown bullets. Do not reveal analysis or reasoning. Do not output Mermaid."
+    )
+    base_user_lines = [
+        f"Code area: {_display_module(module)}",
+        f"Symbol count: {len(nodes)}",
+        "",
+        "Allowed citations:",
+        allowed_citations or "(none)",
+        "",
+        "Coverage anchors by file/domain:",
+        *_module_prompt_anchor_lines(nodes),
+        "",
+        "Representative symbols:",
+        *[
+            f"- {node.name}: `{node.file_path}:{node.start_line}` signature={node.signature or '(unknown)'}"
+            for node in evidence_nodes
+        ],
+        "",
+        "Write 3-5 final Markdown bullets that explain this concept to a new reader: "
+        "what it is and its responsibility, why it exists in the system, how the key "
+        "functions work together to realize it, and how control enters and leaves it. "
+        "Each bullet is 1-2 full sentences of explanation, not a label. "
+        "Start every line with '- '. End EVERY bullet with exactly one trailing "
+        "`(file:line)` citation drawn only from the allowed citations. "
+        "Do not include a preface, labels, hidden reasoning, or draft notes.",
+    ]
+    return _complete_summary_with_repair(
+        llm_client,
+        system=system,
+        base_user="\n".join(base_user_lines),
+        repair_attempts=repair_attempts,
+        audit=lambda summary: evaluate_summary_text(
+            page=_module_slug(module),
+            page_type="module",
+            section="Concept",
+            summary=summary,
+            allowed_citations=set(allowed_tokens),
+            anchor_names={module, _display_module(module)} | {node.name for node in evidence_nodes},
+        ).findings,
+    )
 
 
 def _generate_module_summary(
@@ -1198,6 +1300,79 @@ def _module_boundary_summary(
         cited = ", ".join(f"`{node.name}` at `{node.file_path}:{node.start_line}`" for node in callees[:3])
         parts.append(f"It calls out through {len(outbound_edges)} external call(s), including {cited}.")
     return " ".join(parts)
+
+
+def _mermaid_node_id(key: str) -> str:
+    import hashlib
+
+    return "N" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+
+
+def _architecture_diagram(modules: dict[str, list[SymbolNode]], graph: CodeGraph) -> str:
+    """Deterministic module-dependency flowchart from cross-module call edges.
+
+    Nodes are the code areas; an edge A --> B means at least one symbol in A
+    calls a symbol in B. Purely graph-derived, so it stays as accurate as the
+    call graph itself.
+    """
+    if len(modules) < 2:
+        return ""
+    node_to_module: dict[str, str] = {}
+    for module, module_nodes in modules.items():
+        for node in module_nodes:
+            node_to_module[node.id] = module
+
+    edges: dict[tuple[str, str], int] = {}
+    for edge in graph.edges:
+        if edge.rel != "calls":
+            continue
+        src_mod = node_to_module.get(edge.src_id)
+        dst_mod = node_to_module.get(edge.dst_id)
+        if src_mod is None or dst_mod is None or src_mod == dst_mod:
+            continue
+        edges[(src_mod, dst_mod)] = edges.get((src_mod, dst_mod), 0) + 1
+
+    if not edges:
+        return ""
+
+    lines = ["flowchart TD"]
+    ids = {module: _mermaid_node_id(module) for module in modules}
+    for module in modules:
+        label = _escape_mermaid(_display_module(module))
+        lines.append(f'    {ids[module]}["{label}"]')
+    for (src_mod, dst_mod), count in sorted(edges.items()):
+        suffix = f"{count} calls" if count > 1 else "1 call"
+        lines.append(f"    {ids[src_mod]} -->|{suffix}| {ids[dst_mod]}")
+    return "\n".join(lines)
+
+
+def _runtime_sequence_diagram(nodes: list[SymbolNode]) -> str:
+    """Render the runtime-story main path as a file-to-file sequence diagram.
+
+    Participants are the source files the path touches; each message is one hop
+    in the curated runtime order, labelled with the symbol and its `file:line`.
+    Reuses the same node selection as the Runtime Story so the two always agree.
+    """
+    ordered = _select_runtime_story_nodes(nodes)[:8]
+    if len(ordered) < 2:
+        return ""
+
+    files: list[str] = []
+    for node in ordered:
+        if node.file_path not in files:
+            files.append(node.file_path)
+    lines = ["sequenceDiagram"]
+    file_ids = {path: _mermaid_node_id(path) for path in files}
+    for path in files:
+        lines.append(f"    participant {file_ids[path]} as {_escape_mermaid(path)}")
+    for src, dst in zip(ordered, ordered[1:]):
+        label = _escape_mermaid(f"{dst.name} ({dst.file_path}:{dst.start_line})")
+        lines.append(f"    {file_ids[src.file_path]}->>{file_ids[dst.file_path]}: {label}")
+    return "\n".join(lines)
+
+
+def _escape_mermaid(value: str) -> str:
+    return value.replace('"', "'").replace("\n", " ")
 
 
 def _architecture_summary(modules: dict[str, list[SymbolNode]], flow_roots: list[SymbolNode]) -> str:

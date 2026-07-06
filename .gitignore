@@ -10,3 +10,4 @@ tests/fixtures/**/.makewiki/out/
 workspace/
 .env
 .env.*
+.gstack/

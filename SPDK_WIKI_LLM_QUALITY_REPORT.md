@@ -2,11 +2,11 @@
 
 ## LLM summary track
 
-- summaries evaluated: 124
-- module summaries evaluated: 4
+- summaries evaluated: 128
+- module summaries evaluated: 8
 - symbol summaries evaluated: 120
-- clean pages: 124 (100%)
-- pages with findings: 0
+- clean pages: 127 (99%)
+- pages with findings: 1
 
 ## Document quality track
 
@@ -15,8 +15,9 @@
 
 ## Findings by category
 
-- none
+- empty-summary: 1
 
 ## Worst pages
 
-No findings. Every evaluated summary is grounded and clean.
+### application-lifecycle [module / LLM Summary] (1)
+- **empty-summary**: deterministic fallback fired
