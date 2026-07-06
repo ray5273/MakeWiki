@@ -8,3 +8,5 @@ external/
 tests/fixtures/**/.makewiki/out/
 .tools/
 workspace/
+.env
+.env.*

@@ -7,9 +7,22 @@ import urllib.request
 from dataclasses import dataclass
 
 from makewiki.errors import LLMError
+from makewiki.llm.base import FallbackLLMClient, LLMClient
 
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_LOCKED_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+
+# Ordered free-tier fallback chain. Gemma 4 is a non-reasoning, strong
+# instruction follower (clean summaries, no chain-of-thought leaking into the
+# output); the non-reasoning nemotron is the backup when Gemma is rate-limited.
+# Both are free models, tried per call by FallbackLLMClient.
+OPENROUTER_DEFAULT_MODELS = (
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+)
+
+# Kept as an alias for backwards compatibility with earlier callers/tests that
+# imported the single locked-model name.
+OPENROUTER_LOCKED_MODEL = OPENROUTER_DEFAULT_MODELS[0]
 
 
 @dataclass(frozen=True)
@@ -63,11 +76,20 @@ class OpenRouterClient:
         return content.strip()
 
 
-def openrouter_from_env(*, model: str | None = None) -> OpenRouterClient:
+def openrouter_from_env(*, model: str | None = None) -> LLMClient:
+    """Build an OpenRouter client from the environment.
+
+    With no explicit model, returns a FallbackLLMClient over the default
+    free-tier chain (Gemma 4 first, non-reasoning nemotron as backup). An
+    explicit `model` (or `OPENROUTER_MODEL`) pins a single model instead.
+    """
     api_key = os.environ.get("OPENROUTER_API_KEY")
     requested_model = model or os.environ.get("OPENROUTER_MODEL")
     if not api_key:
         raise LLMError("OPENROUTER_API_KEY is required for --llm openrouter")
-    if requested_model and requested_model != OPENROUTER_LOCKED_MODEL:
-        raise LLMError(f"OpenRouter model is locked to {OPENROUTER_LOCKED_MODEL}")
-    return OpenRouterClient(api_key=api_key, model=OPENROUTER_LOCKED_MODEL)
+    if requested_model:
+        return OpenRouterClient(api_key=api_key, model=requested_model)
+    clients: list[LLMClient] = [
+        OpenRouterClient(api_key=api_key, model=name) for name in OPENROUTER_DEFAULT_MODELS
+    ]
+    return FallbackLLMClient(clients)

@@ -4,10 +4,40 @@ import time
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from makewiki.errors import LLMError
+
 
 class LLMClient(Protocol):
     def complete(self, *, system: str, user: str) -> str:
         ...
+
+
+@dataclass
+class FallbackLLMClient:
+    """Try each client in order, falling to the next on LLMError.
+
+    Free OpenRouter models rate-limit aggressively, so the fallback runs per
+    call: the primary model is attempted first, and any LLMError (HTTP error,
+    empty completion) advances to the next client. If every client fails, the
+    last error is re-raised so the caller sees a real failure rather than a
+    silent empty summary.
+    """
+
+    clients: list[LLMClient]
+
+    def __post_init__(self) -> None:
+        if not self.clients:
+            raise ValueError("FallbackLLMClient requires at least one client")
+
+    def complete(self, *, system: str, user: str) -> str:
+        last_error: LLMError | None = None
+        for client in self.clients:
+            try:
+                return client.complete(system=system, user=user)
+            except LLMError as exc:
+                last_error = exc
+        assert last_error is not None  # non-empty clients guarantees a failure
+        raise last_error
 
 
 @dataclass
